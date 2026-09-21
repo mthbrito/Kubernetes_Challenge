@@ -5,15 +5,45 @@ persistência de dados, configuração externalizada, health checks e autoescala
 
 ## Arquitetura
 
+O fluxo é uma cadeia única, de cima para baixo: sua requisição entra pela API e a API
+repassa para o banco. A API é o meio de campo — só ela conversa com as duas pontas
+(você, de um lado; o Postgres, do outro):
+
 ```
-Você (curl) → api-service (NodePort) → Deployment api (PostgREST)
-                                              │
-                                              ▼ DNS interno (postgres-service)
-                                        Deployment postgres → PVC (dados persistentes)
+ Você (curl)
+     │
+     │ HTTP :30000 (NodePort) ou :3000 (port-forward)
+     ▼
+┌──────────────────┐
+│  api-service     │   Service que expõe a API para fora do cluster
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│  Deployment api  │   PostgREST — lê PGRST_DB_URI e conecta no banco
+│  (PostgREST)     │   usando o NOME do Service abaixo, não um IP
+└────────┬─────────┘
+         │
+         │ DNS interno do cluster → "postgres-service"
+         ▼
+┌─────────────────────┐
+│  postgres-service   │   Service (ClusterIP) — só acessível dentro do cluster
+└─────────┬───────────┘
+          │
+          ▼
+┌───────────────────────┐
+│  Deployment postgres  │
+└──────────┬────────────┘
+           │
+           ▼
+┌───────────────────────────┐
+│  PVC (dados persistentes) │   Sobrevive mesmo se o Pod do Postgres for recriado
+└───────────────────────────┘
 ```
 
 A API encontra o banco pelo **nome do Service** (`postgres-service`), nunca por IP —
-é assim que a conexão sobrevive a um restart do Pod do Postgres.
+é assim que a conexão sobrevive a um restart do Pod do Postgres: o IP do Pod muda a
+cada recriação, mas o nome do Service e o endereço do PVC não mudam.
 
 ## Pré-requisitos
 
@@ -22,6 +52,23 @@ A API encontra o banco pelo **nome do Service** (`postgres-service`), nunca por 
 - `kubectl` configurado apontando para esse cluster.
 - Nenhuma imagem precisa ser buildada — `postgres:16` e `postgrest/postgrest` são
   baixadas automaticamente do Docker Hub.
+
+**Se você for usar Minikube com driver Docker**, o Docker precisa estar rodando
+*antes* de iniciar o cluster — o driver Docker cria o nó do Kubernetes como um
+container Docker:
+
+```bash
+# confirme que o Docker está de pé
+docker info
+
+# suba o cluster (se ainda não estiver rodando)
+minikube start --driver=docker
+```
+
+Se o Docker não estiver ativo, `minikube start` falha com erro de conexão ao
+daemon (`Cannot connect to the Docker daemon...`). Com Rancher Desktop ou Docker
+Desktop, basta o app estar aberto e o Kubernetes habilitado nas configurações antes
+do próximo passo.
 
 Confirme que o cluster está de pé antes de continuar:
 
@@ -43,6 +90,16 @@ kubectl get nodes
 | `06-api-deployment.yaml` | Deployment | PostgREST, 2 réplicas, probes de liveness/readiness, requests/limits de CPU/memória |
 | `07-api-service.yaml` | Service (NodePort) | Expõe a API na porta `30000` |
 | `08-api-hpa.yaml` | HorizontalPodAutoscaler | Escala a API entre 1 e 5 réplicas por uso de CPU (>50%) |
+
+> **Nota sobre `PGRST_DB_ANON_ROLE`:** em `06-api-deployment.yaml`, a role anônima do
+> PostgREST é o próprio `POSTGRES_USER` (superusuário do Postgres). Na prática, isso
+> significa que **qualquer `curl` na API, sem nenhuma autenticação, executa no banco
+> com privilégios de superusuário** — lê e escreve em qualquer tabela, sem nenhum
+> controle de permissão. É uma simplificação intencional, feita para manter o foco do
+> desafio na integração via Service DNS. Em um cenário real, o correto seria criar uma
+> role dedicada com permissões restritas (padrão do PostgREST: `authenticator` +
+> `web_anon`), para que requisições anônimas só consigam fazer o que foi
+> explicitamente liberado para elas.
 
 ## Passo 1 — Criar o Namespace
 
@@ -116,6 +173,27 @@ kubectl port-forward -n kubernetes-challenge svc/api-service 3000:3000 &
 
 A API fica disponível em `http://localhost:3000`.
 
+**Se a porta 3000 já estiver em uso na sua máquina** (é comum — muitos projetos
+Node/React sobem servidor de dev nela por padrão), o `port-forward` falha com
+`bind: address already in use` ou simplesmente não responde. Nesse caso, use uma
+porta local diferente, mantendo a porta do Service (`3000`) do lado direito do `:`:
+
+```bash
+kubectl port-forward -n kubernetes-challenge svc/api-service 3300:3000 &
+```
+
+A API passa a ficar disponível em `http://localhost:3300` (ajuste os `curl` dos
+próximos passos de acordo com a porta que você escolheu). Para descobrir o que está
+ocupando uma porta antes de trocar:
+
+```bash
+# Linux/Mac
+lsof -i :3000
+
+# Windows (PowerShell)
+Get-Process -Id (Get-NetTCPConnection -LocalPort 3000).OwningProcess
+```
+
 **Se você usa Rancher Desktop, Docker Desktop ou Kind com port mapping configurado**,
 o NodePort tende a funcionar direto:
 
@@ -123,10 +201,12 @@ o NodePort tende a funcionar direto:
 curl http://localhost:30000/
 ```
 
-Teste com:
+Teste com (ajuste a porta conforme o método de acesso escolhido acima):
 
 ```bash
-curl http://localhost:3000/    # ou :30000, dependendo do seu ambiente
+curl http://localhost:3000/    # port-forward padrão
+# ou :3300 se trocou a porta local
+# ou :30000 se está usando NodePort direto
 ```
 
 Resposta esperada: um JSON descrevendo o schema exposto pelo PostgREST (mesmo sem
@@ -254,6 +334,7 @@ kubectl describe hpa api-hpa -n kubernetes-challenge
 | `PGRST002` / `unexpected spaces found in "..."` | Secret gerado com `echo texto \| base64` sem `-n`, adicionando `\n` ao valor | Recriar o Secret com `kubectl create secret generic --from-literal=...` |
 | `password authentication failed for user "postgres"` mesmo após corrigir o Secret | O Postgres só lê `POSTGRES_PASSWORD` na primeira inicialização do volume; um PVC já existente mantém a senha antiga | `kubectl delete deployment postgres` + `kubectl delete pvc postgres-pvc`, depois reaplicar `03` e `04` |
 | `curl: connection refused` no `localhost:30000` | Minikube com driver Docker não expõe NodePort diretamente ao host | Usar `kubectl port-forward svc/api-service 3000:3000 &` |
+| `bind: address already in use` no `port-forward`, ou porta 3000 não responde como esperado | Outro processo local (ex.: servidor de dev Node/React) já está usando a porta 3000 | Mapear para uma porta local diferente: `kubectl port-forward svc/api-service 3300:3000 &` e ajustar os `curl` |
 | `kubectl top pods` falha mesmo com metrics-server `Running` | Certificado TLS self-signed do Minikube rejeitado pelo metrics-server | Patch `--kubelet-insecure-tls` (Passo 7) |
 | HPA mostra `TARGETS: <unknown>` | Falta `resources.requests.cpu` no Deployment da API | Definir `resources.requests` (já presente em `06-api-deployment.yaml`) |
 | Pod em `CreateContainerConfigError` | Deployment aplicado antes do Secret existir | Criar o Secret primeiro (Passo 2), depois reaplicar o Deployment |
@@ -264,6 +345,42 @@ kubectl describe hpa api-hpa -n kubernetes-challenge
 ```bash
 kubectl delete namespace kubernetes-challenge
 ```
-
 Isso remove todos os recursos do desafio de uma vez — Deployments, Services, PVC,
 Secret, ConfigMap e HPA.
+
+## Evidências
+
+```
+1. kubectl get all do namespace mostrando tudo rodando
+```
+
+![alt text](evidence/kubectl-get-all.png)
+
+
+```
+2. A API respondendo com dados vindos do banco (a integração funcionando)
+```
+
+![alt text](evidence//get-itens.png)
+
+
+```
+3. Persistência: o mesmo dado acessível pela API antes e depois de deletar o Pod do PostgreSQL
+```
+
+```bash
+# Antes
+```
+![alt text](evidence/before-delete-01.png)
+
+![alt text](evidence/before-delete-02.png)
+
+![alt text](evidence/before-delete-03.png)
+
+![alt text](evidence/before-delete-04.png)
+
+
+```bash
+# Depois
+```
+![alt text](evidence/after-delete.png)
